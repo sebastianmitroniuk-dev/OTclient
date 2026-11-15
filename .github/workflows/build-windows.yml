@@ -1,95 +1,120 @@
+
 name: Build - Windows
 
 on:
   workflow_dispatch:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - "src/**"
-      - "vcpkg.json"
-      - "CMakeLists.txt"
-      - ".github/workflows/build-windows.yml"
   push:
     branches: [main]
     paths:
       - "src/**"
       - "vcpkg.json"
       - "CMakeLists.txt"
+      - "CMakePresets.json"
       - ".github/workflows/build-windows.yml"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
-  pull-requests: read
 
 env:
   CMAKE_BUILD_PARALLEL_LEVEL: 2
-  MAKEFLAGS: "-j 2"
 
 jobs:
   build:
-    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     name: windows-2022-release
     runs-on: windows-2022
-
-    concurrency:
-      group: crystalotc-${{ github.workflow }}-${{ github.ref }}
-      cancel-in-progress: true
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Get vcpkg commit ID
-        id: vcpkg-step
+      - name: Read vcpkg baseline
+        id: vcpkg
         shell: pwsh
         run: |
           $json = Get-Content vcpkg.json -Raw | ConvertFrom-Json
           $commit = $json.'builtin-baseline'
-          echo "vcpkgGitCommitId=$commit" >> $env:GITHUB_OUTPUT
+          if ($commit -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "Invalid vcpkg baseline"
+          }
+          "commit=$commit" >> $env:GITHUB_OUTPUT
 
-      - name: Validate vcpkg baseline SHA
+      - name: Install vcpkg
+        uses: lukka/run-vcpkg@a400452f634fe49e9f18d388aeb1809dcc642136
+        with:
+          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.commit }}
+
+      - name: Install CMake and Ninja
+        uses: lukka/get-cmake@v3.31.6
+
+      - name: Configure CMake
         shell: pwsh
         run: |
-          $SHAS = "${{ steps.vcpkg-step.outputs.vcpkgGitCommitId }}"
-          if ([string]::IsNullOrEmpty($SHAS)) {
-            echo "::error title=Missing vcpkg baseline::Provide a full 40-char vcpkgGitCommitId."
-            exit 1
-          }
-          if ($SHAS -notmatch '^[0-9a-f]{40}$') {
-            echo "::error title=Invalid vcpkg baseline::vcpkgGitCommitId must be a full 40-char commit SHA."
-            exit 1
+          cmake --preset windows-release -DOTCLIENT_BUILD_TESTS=OFF
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configuration failed"
           }
 
-      - name: Compute vcpkg.json hash
-        id: hash
+      - name: Build CrystalOTC
         shell: pwsh
         run: |
-          $json = Get-Content "vcpkg.json" -Raw -Encoding UTF8
-          $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-          $sha256 = [System.Security.Cryptography.SHA256]::Create()
-          $hashBytes = $sha256.ComputeHash($bytes)
-          $hash = [BitConverter]::ToString($hashBytes) -replace '-', ''
-          "hash=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          cmake --build --preset windows-release --parallel 2
+          if ($LASTEXITCODE -ne 0) {
+            throw "Compilation failed"
+          }
 
-      - name: Cache vcpkg artifacts
-        uses: actions/cache@v4
+      - name: Prepare complete client
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = $env:GITHUB_WORKSPACE
+          $output = Join-Path $root "CrystalOTC-Windows"
+
+          New-Item -ItemType Directory -Force -Path $output | Out-Null
+
+          $exe = Get-ChildItem (Join-Path $root "build") -Recurse -File -Filter "*.exe" |
+            Where-Object {
+              $_.Name -match '^(otclient|CrystalOTC).*\.exe$'
+            } |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "Client executable not found"
+          }
+
+          Copy-Item $exe.FullName (Join-Path $output "CrystalOTC.exe")
+
+          Get-ChildItem $exe.DirectoryName -Filter "*.dll" -File |
+            Copy-Item -Destination $output
+
+          foreach ($folder in @("data", "modules", "mods")) {
+            $source = Join-Path $root $folder
+            if (-not (Test-Path $source)) {
+              throw "Required folder missing: $folder"
+            }
+            Copy-Item $source $output -Recurse -Force
+          }
+
+          $init = Join-Path $root "init.lua"
+          if (-not (Test-Path $init)) {
+            throw "init.lua not found"
+          }
+          Copy-Item $init $output
+
+          foreach ($folder in @("assets", "layouts")) {
+            $source = Join-Path $root $folder
+            if (Test-Path $source) {
+              Copy-Item $source $output -Recurse -Force
+            }
+          }
+
+          Write-Host "Client package prepared successfully"
+
+      - name: Upload CrystalOTC package
+        uses: actions/upload-artifact@v4
         with:
-          path: |
-            ${{ github.workspace }}/vcpkg/installed
-            ${{ github.workspace }}/vcpkg/buildtrees
-            ${{ github.workspace }}/vcpkg/downloads
-          key: vcpkg-windows-release-${{ steps.hash.outputs.hash }}
-          restore-keys: |
-            vcpkg-windows-release-
-
-      - name: Compiler cache (sccache)
-        uses: hendrikmuhs/ccache-action@main
-        with:
-          max-size: "1G"
-          variant: "sccache"
-          key: ccache-windows-release
-          restore-keys: |
-            ccache-windows-release
-
-      - name: Remove Windows pre-installed MySQL (for clean builds)
-        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:/mysql*"
+          name: CrystalOTC-Windows-Complete
+          path: CrystalOTC-Windows/
+          if-no-files-found: error
+          retention-days: 7
