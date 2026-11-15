@@ -1,3 +1,67 @@
+name: Build - Windows
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "src/**"
+      - "vcpkg.json"
+      - "CMakeLists.txt"
+      - ".github/workflows/build-windows.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "vcpkg.json"
+      - "CMakeLists.txt"
+      - ".github/workflows/build-windows.yml"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 2
+  MAKEFLAGS: "-j 2"
+
+jobs:
+  build:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    name: windows-2022-release
+    runs-on: windows-2022
+
+    concurrency:
+      group: crystalotc-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get vcpkg commit ID
+        id: vcpkg-step
+        shell: pwsh
+        run: |
+          $json = Get-Content vcpkg.json -Raw | ConvertFrom-Json
+          $commit = $json.'builtin-baseline'
+          echo "vcpkgGitCommitId=$commit" >> $env:GITHUB_OUTPUT
+
+      - name: Validate vcpkg baseline SHA
+        shell: pwsh
+        run: |
+          $SHAS = "${{ steps.vcpkg-step.outputs.vcpkgGitCommitId }}"
+          if ([string]::IsNullOrEmpty($SHAS)) {
+            echo "::error title=Missing vcpkg baseline::Provide a full 40-char vcpkgGitCommitId."
+            exit 1
+          }
+          if ($SHAS -notmatch '^[0-9a-f]{40}$') {
+            echo "::error title=Invalid vcpkg baseline::vcpkgGitCommitId must be a full 40-char commit SHA."
+            exit 1
+          }
+
+      - name: Compute vcpkg.json hash
+        id: hash
         shell: pwsh
         run: |
           $json = Get-Content "vcpkg.json" -Raw -Encoding UTF8
@@ -29,99 +93,3 @@
 
       - name: Remove Windows pre-installed MySQL (for clean builds)
         run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:/mysql*"
-
-      - name: Install vcpkg
-        uses: lukka/run-vcpkg@a400452f634fe49e9f18d388aeb1809dcc642136
-        with:
-          vcpkgGitCommitId: ${{ steps.vcpkg-step.outputs.vcpkgGitCommitId }}
-
-      - name: Get latest CMake and Ninja
-        uses: lukka/get-cmake@v3.31.6
-
-      - name: Configure and Build
-        uses: lukka/run-cmake@main
-        with:
-          configurePreset: windows-release
-          buildPreset: windows-release
-
-      - name: Prepare complete client artifact
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $root = $env:GITHUB_WORKSPACE
-          $artifactDir = Join-Path $root 'artifacts'
-          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
-
-          $exePath = Get-ChildItem -Recurse -Path (Join-Path $root 'build') -Filter 'otclient*.exe' -File |
-            Where-Object { $_.FullName -notmatch '[\\/]vcpkg_installed[\\/]' } |
-            Select-Object -First 1
-          if (-not $exePath) { throw 'otclient*.exe not found!' }
-          Copy-Item $exePath.FullName -Destination (Join-Path $artifactDir 'CrystalOTC.exe')
-
-          Get-ChildItem -Path $exePath.Directory.FullName -Filter '*.dll' -File | ForEach-Object {
-            Copy-Item $_.FullName -Destination $artifactDir -Force
-          }
-
-          foreach ($folder in @('data', 'modules', 'mods', 'assets')) {
-            $source = Join-Path $root $folder
-            if (Test-Path $source -PathType Container) {
-              Copy-Item $source -Destination (Join-Path $artifactDir $folder) -Recurse -Force
-              Write-Host "Included $folder"
-            } else {
-              Write-Warning "Folder not found: $folder"
-            }
-          }
-
-          foreach ($file in @('init.lua', 'config.otml')) {
-            $source = Join-Path $root $file
-            if (Test-Path $source -PathType Leaf) {
-              Copy-Item $source -Destination $artifactDir -Force
-              Write-Host "Included $file"
-            }
-          }
-
-          Write-Host 'Artifact root contents:'
-          Get-ChildItem $artifactDir | Select-Object Name, Length | Format-Table -AutoSize
-          foreach ($required in @('data', 'modules', 'init.lua')) {
-            if (-not (Test-Path (Join-Path $artifactDir $required))) {
-              throw "Required client resource missing: $required"
-            }
-          }
-
-      - name: Upload complete client artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: CrystalOTC-windows-release
-          path: ${{ github.workspace }}/artifacts/
-          if-no-files-found: error
-          retention-days: 14
-
-  release:
-    name: Publish "latest" release
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: CrystalOTC-windows-release
-          path: artifacts
-
-      - name: Zip client package
-        run: cd artifacts && zip -r ../CrystalOTC-windows.zip .
-
-      - name: Recreate "latest" release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release delete latest -R "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
-          gh release create latest CrystalOTC-windows.zip \
-            -R "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --prerelease \
-            --title "Latest build ($(date -u +%Y-%m-%d), ${GITHUB_SHA::7})" \
-            --notes "Automatic build of main commit ${GITHUB_SHA::7}. Includes executable, repository runtime resources, and available adjacent DLLs. Additional game assets may be required."
