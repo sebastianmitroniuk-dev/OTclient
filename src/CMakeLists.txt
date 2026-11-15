@@ -917,7 +917,6 @@ else() # Linux
 
           absl::log_internal_check_op
           Threads::Threads
-          X11::X11
           asio::asio
           OpenAL::OpenAL
           LibLZMA::LibLZMA
@@ -933,6 +932,11 @@ else() # Linux
           Vorbis::vorbis
           Freetype::Freetype
   )
+
+  # X11 is only available on Linux/Unix systems that provide its imported target.
+  if(UNIX AND NOT APPLE AND NOT ANDROID AND NOT WASM AND TARGET X11::X11)
+    target_link_libraries(otclient_core PUBLIC X11::X11)
+  endif()
 
   if (TOGGLE_FRAMEWORK_PROTOBUF)
       target_link_libraries(otclient_core
